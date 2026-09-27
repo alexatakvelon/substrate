@@ -28,6 +28,11 @@ const (
 	// SandboxClassMicroVM is the micro-VM runtime (cmd/ateom-microvm); needs
 	// /dev/kvm and vhost devices.
 	SandboxClassMicroVM SandboxClass = "microvm"
+	// SandboxClassFirecracker is the Firecracker micro-VM runtime
+	// (cmd/ateom-firecracker); like the cloud-hypervisor micro-VM class it needs
+	// /dev/kvm, but backs the actor rootfs with virtio-block rather than
+	// virtio-fs (Firecracker has no virtio-fs device).
+	SandboxClassFirecracker SandboxClass = "firecracker"
 )
 
 // AssetFile is one content-addressed file that atelet fetches for a sandbox
@@ -56,7 +61,7 @@ type SandboxConfigSpec struct {
 	// sandbox_config.sandbox_class.
 	//
 	// +required
-	// +kubebuilder:validation:Enum=gvisor;microvm
+	// +kubebuilder:validation:Enum=gvisor;microvm;firecracker
 	// +kubebuilder:default=gvisor
 	SandboxClass SandboxClass `json:"sandboxClass"`
 
@@ -81,10 +86,12 @@ type SandboxConfigSpec struct {
 	// asset names are interpreted by the sandbox backend: gVisor expects a
 	// "gvisor" asset (the release's gvisor.tar.zstd, which atelet extracts so
 	// the gvisor-bin/ helpers sit next to runsc; a legacy bare-binary "runsc"
-	// asset is still accepted); a micro-VM backend expects several (e.g.
-	// "cloud-hypervisor", "kata-kernel", "kata-image"). The schema is
-	// intentionally generic; per-class requirements are enforced by a
-	// ValidatingAdmissionPolicy.
+	// asset is still accepted); a cloud-hypervisor micro-VM backend expects
+	// several (e.g. "cloud-hypervisor", "virtiofsd", "kata-kernel",
+	// "kata-image"); the Firecracker backend expects "firecracker",
+	// "kata-kernel", and "kata-image" (no virtiofsd — its actor rootfs is
+	// virtio-block, not virtio-fs). The schema is intentionally generic;
+	// per-class requirements are enforced by a ValidatingAdmissionPolicy.
 	//
 	// +optional
 	Assets map[string]map[string]AssetFile `json:"assets,omitempty"`

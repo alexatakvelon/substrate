@@ -86,6 +86,7 @@ spec:
                 enum:
                 - gvisor
                 - microvm
+                - firecracker
                 type: string
               template:
                 description: Template holds optional metadata, scheduling, and resource

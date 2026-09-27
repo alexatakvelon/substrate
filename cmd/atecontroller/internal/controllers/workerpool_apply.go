@@ -187,7 +187,7 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 		)
 
 	applyWorkerPoolPodTemplate(podSpecAC, containerAC, wp.Spec.Template)
-	maybeApplyMicroVMPodShape(podSpecAC, containerAC, wp.Spec.SandboxClass)
+	maybeApplyVMPodShape(podSpecAC, containerAC, wp.Spec.SandboxClass)
 	podSpecAC.WithContainers(containerAC)
 	podSpecAC.WithTerminationGracePeriodSeconds(workerTerminationGracePeriodSeconds)
 
@@ -306,9 +306,13 @@ var ateomMicroVMCapabilities = slices.Concat(ateomGvisorCapabilities, []corev1.C
 })
 
 // ateomSecurityContext returns the ateom container security context for a sandbox
-// class. Neither class runs privileged; they differ in their capability set.
-// Both declare seccomp Unconfined because their sandbox child pivot_root()s,
-// which the default profile denies. An empty class defaults to gVisor.
+// class. No class runs privileged; they differ in their capability set. All
+// declare seccomp Unconfined because their sandbox child pivot_root()s (or, for
+// a VM class, enters namespaces), which the default profile denies. The
+// Firecracker class shares gVisor's capability set — it needs NET_ADMIN /
+// SYS_ADMIN to build the tap and enter the interior netns, but none of
+// virtiofsd's extra caps, since its actor rootfs is virtio-block, not
+// virtio-fs — so it takes the default branch. An empty class defaults to gVisor.
 func ateomSecurityContext(class atev1alpha1.SandboxClass) *corev1ac.SecurityContextApplyConfiguration {
 	// Both runtimes mount inside the worker — runsc pivots root and the worker
 	// remounts /sys/fs/cgroup to nest per-actor cgroups; the micro-VM worker
@@ -353,21 +357,23 @@ func ateomSecurityContext(class atev1alpha1.SandboxClass) *corev1ac.SecurityCont
 			WithType(corev1.SeccompProfileTypeUnconfined))
 }
 
-// maybeApplyMicroVMPodShape adds the /dev/kvm device and node placement a
-// micro-VM (kata + cloud-hypervisor) worker pool needs, on top of any
-// pod-template settings. No-op unless sandboxClass is the micro-VM class.
+// maybeApplyVMPodShape adds the /dev/kvm device and node placement a VM-based
+// worker pool needs, on top of any pod-template settings. It applies to every
+// sandbox class that boots a guest under KVM — the cloud-hypervisor micro-VM
+// class and the Firecracker class — since both need the same host devices and
+// KVM-capable node placement. No-op for non-VM classes (e.g. gVisor).
 //
-// TODO: this hardcodes one sandbox class's pod requirements in the controller.
+// TODO: this hardcodes the VM classes' pod requirements in the controller.
 // Consider making it generic so a sandbox class can declare its own pod shape
 // (e.g. required devices/mounts + node placement on the SandboxConfig spec)
 // instead of branching on SandboxClass here, so new classes don't need a
 // controller change.
-func maybeApplyMicroVMPodShape(
+func maybeApplyVMPodShape(
 	podSpecAC *corev1ac.PodSpecApplyConfiguration,
 	containerAC *corev1ac.ContainerApplyConfiguration,
 	sandboxClass atev1alpha1.SandboxClass,
 ) {
-	if sandboxClass != atev1alpha1.SandboxClassMicroVM {
+	if sandboxClass != atev1alpha1.SandboxClassMicroVM && sandboxClass != atev1alpha1.SandboxClassFirecracker {
 		return
 	}
 
@@ -420,7 +426,7 @@ func maybeApplyMicroVMPodShape(
 	podSpecAC.WithTolerations(corev1ac.Toleration().
 		WithKey("ate.dev/sandboxClass").
 		WithOperator(corev1.TolerationOpEqual).
-		WithValue(string(atev1alpha1.SandboxClassMicroVM)).
+		WithValue(string(sandboxClass)).
 		WithEffect(corev1.TaintEffectNoSchedule))
 }
 

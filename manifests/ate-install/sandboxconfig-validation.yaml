@@ -48,6 +48,17 @@ spec:
          ['cloud-hypervisor', 'virtiofsd', 'kata-kernel', 'kata-image']
            .all(name, name in object.spec.assets[arch])))
     message: "a microvm SandboxConfig must define cloud-hypervisor, virtiofsd, kata-kernel, and kata-image assets for every architecture under spec.assets"
+  # The Firecracker runtime needs the VMM binary plus the kata guest kernel and
+  # image for every architecture it advertises. Unlike the cloud-hypervisor
+  # class it needs no virtiofsd: the actor rootfs is served over virtio-block,
+  # not virtio-fs.
+  - expression: >-
+      object.spec.sandboxClass != 'firecracker' ||
+      (has(object.spec.assets) && size(object.spec.assets) > 0 &&
+       object.spec.assets.all(arch,
+         ['firecracker', 'kata-kernel', 'kata-image']
+           .all(name, name in object.spec.assets[arch])))
+    message: "a firecracker SandboxConfig must define firecracker, kata-kernel, and kata-image assets for every architecture under spec.assets"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

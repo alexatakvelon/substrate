@@ -1,0 +1,90 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Worker pool + SandboxConfig for the Firecracker micro-VM variant of the
+# counter demo. This is the skeleton stage of the Firecracker backend
+# (cmd/ateom-firecracker): it cold-boots a bare Firecracker VM with the kata
+# guest and proves boot + kata-agent reachability + networking. Snapshot/restore
+# (suspend/resume) is NOT yet implemented, so unlike the cloud-hypervisor variant
+# this pool cannot yet round-trip the in-RAM counter across pods.
+#
+# Like the cloud-hypervisor micro-VM demo, the SandboxConfig assets are
+# node-arch-specific and are not shipped with the platform: stage a
+# `firecracker` binary and the kata `vmlinux` + `rootfs.img` into your cluster's
+# object store and fill in the URLs and sha256 sums below.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ate-demo-counter-firecracker
+
+---
+
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: counter-firecracker
+  namespace: ate-demo-counter-firecracker
+  labels:
+    workload: counter-firecracker
+spec:
+  # Two workers: one for the demo actor, one spare for the golden actor the
+  # template reconciler runs while building the golden snapshot.
+  replicas: 2
+  sandboxClass: firecracker
+  workerImage: ko://github.com/agent-substrate/substrate/cmd/ateom-firecracker
+  template:
+    nodeSelector:
+      ate.dev/substrate-version: "${SUBSTRATE_VERSION}"
+    # Per-worker resources size the worker POD (the per-actor ceiling); the VM
+    # itself is sized by the ActorTemplate's resources. Memory is not
+    # compressible, so its request matches the limit: the guest RAM plus the VMM
+    # reserve has to be really there.
+    resources:
+      limits:
+        cpu: "1"
+        memory: 1Gi
+      requests:
+        cpu: 250m
+        memory: 1Gi
+
+---
+
+# Cluster-wide SandboxConfig for the Firecracker sandbox class. atelet fetches
+# these assets for the worker node's architecture; ateom-firecracker boots the
+# guest kernel (kata-kernel) with the kata rootfs image (kata-image) as the root
+# virtio-block device, and relaunches the "firecracker" VMM binary. Unlike the
+# cloud-hypervisor class there is no virtiofsd asset: the actor rootfs is
+# virtio-block, not virtio-fs.
+#
+# assets is single-arch: fill in the arch matching your worker nodes and paste
+# the real object-store URLs + sha256 sums.
+apiVersion: ate.dev/v1alpha1
+kind: SandboxConfig
+metadata:
+  name: firecracker-default
+spec:
+  sandboxClass: firecracker
+  pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
+  assets:
+    ${NODE_ARCH}:
+      firecracker:
+        url: "${FIRECRACKER_URL}"
+        sha256: "${FIRECRACKER_SHA256}"
+      kata-kernel:
+        url: "${KATA_KERNEL_URL}"
+        sha256: "${KATA_KERNEL_SHA256}"
+      kata-image:
+        url: "${KATA_IMAGE_URL}"
+        sha256: "${KATA_IMAGE_SHA256}"

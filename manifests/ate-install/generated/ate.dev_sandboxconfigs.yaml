@@ -97,10 +97,12 @@ spec:
                   asset names are interpreted by the sandbox backend: gVisor expects a
                   "gvisor" asset (the release's gvisor.tar.zstd, which atelet extracts so
                   the gvisor-bin/ helpers sit next to runsc; a legacy bare-binary "runsc"
-                  asset is still accepted); a micro-VM backend expects several (e.g.
-                  "cloud-hypervisor", "kata-kernel", "kata-image"). The schema is
-                  intentionally generic; per-class requirements are enforced by a
-                  ValidatingAdmissionPolicy.
+                  asset is still accepted); a cloud-hypervisor micro-VM backend expects
+                  several (e.g. "cloud-hypervisor", "virtiofsd", "kata-kernel",
+                  "kata-image"); the Firecracker backend expects "firecracker",
+                  "kata-kernel", and "kata-image" (no virtiofsd — its actor rootfs is
+                  virtio-block, not virtio-fs). The schema is intentionally generic;
+                  per-class requirements are enforced by a ValidatingAdmissionPolicy.
                 type: object
               pauseImage:
                 description: |-
@@ -128,6 +130,7 @@ spec:
                 enum:
                 - gvisor
                 - microvm
+                - firecracker
                 type: string
             required:
             - pauseImage

@@ -148,10 +148,12 @@ func (p *sandboxPrewarmer) skipConfig(ctx context.Context, cfg *v1alpha1.Sandbox
 	case v1alpha1.SandboxClassGvisor:
 		// Every node runs gVisor workers; always prewarm.
 		return false
-	case v1alpha1.SandboxClassMicroVM:
+	case v1alpha1.SandboxClassMicroVM, v1alpha1.SandboxClassFirecracker:
+		// Both VM classes need /dev/kvm; a node without it can never run them,
+		// and their guest images run to hundreds of MiB, so skip the fetch.
 		if !p.microvmCapable {
-			slog.DebugContext(ctx, "Skipping sandbox asset prewarm: node has no /dev/kvm, cannot run micro-VM workers",
-				slog.String("config", cfg.Name))
+			slog.DebugContext(ctx, "Skipping sandbox asset prewarm: node has no /dev/kvm, cannot run VM workers",
+				slog.String("config", cfg.Name), slog.String("sandboxClass", string(cfg.Spec.SandboxClass)))
 			return true
 		}
 		return false
