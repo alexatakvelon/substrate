@@ -61,13 +61,17 @@ const (
 
 // defaultKataBootArgs is the guest kernel command line for a kata rootfs-image
 // boot on Firecracker. Firecracker exposes virtio-mmio (no PCI) and a serial
-// console on ttyS0. root=/dev/vda1 assumes a partitioned kata image; a
-// whole-disk image roots at /dev/vda -- tune via --guest-boot-args to match the
-// staged kata-image. init=/usr/bin/kata-agent runs the agent as PID 1.
-const defaultKataBootArgs = "console=ttyS0 reboot=k panic=1 pci=off nomodule " +
-	"i8042.noaux=1 i8042.nomux=1 i8042.nopnp=1 i8042.dumbkbd=1 " +
-	"root=/dev/vda1 rootfstype=ext4 rootflags=data=ordered,errors=remount-ro ro " +
-	"init=/usr/bin/kata-agent"
+// console on ttyS0. root=/dev/vda1 roots the ext4 partition of the kata image;
+// a whole-disk image roots at /dev/vda -- tune via --guest-boot-args to match
+// the staged kata-image.
+//
+// No init= override: the kata rootfs image is systemd-based and starts the
+// kata-agent through kata-agent.service (kata-containers.target). Running the
+// agent directly as PID 1 (init=/usr/bin/kata-agent) skips that setup and the
+// agent halts, so the guest boots with the image's default init. Validated on a
+// KVM node.
+const defaultKataBootArgs = "console=ttyS0 reboot=k panic=1 pci=off " +
+	"root=/dev/vda1 rootfstype=ext4 ro"
 
 // fcVMDir is the per-actor runtime dir holding the api-socket, the vsock uds, and
 // the console log. It sits under the actor's ateom path so teardown and the

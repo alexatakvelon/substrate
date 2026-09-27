@@ -230,8 +230,12 @@ func (s *AteomService) coldBootActor(ctx context.Context, req *ateompb.RunWorklo
 	if err := client.PutBootSource(ctx, fc.BootSource{KernelImagePath: kernel, BootArgs: bootArgs}); err != nil {
 		return err
 	}
-	// The kata rootfs image is the read-only root block device (/dev/vda).
-	if err := client.PutDrive(ctx, fc.Drive{DriveID: rootDriveID, PathOnHost: image, IsRootDevice: true, IsReadOnly: true}); err != nil {
+	// The kata rootfs image is the read-only root block device (/dev/vda), rooted
+	// at its ext4 partition /dev/vda1 via the boot args. IsRootDevice is
+	// deliberately false: when true, Firecracker appends its own "root=/dev/vda"
+	// to the kernel cmdline, which overrides root=/dev/vda1 and makes the guest
+	// try to mount the whole (partitioned) disk and panic. Validated on a KVM node.
+	if err := client.PutDrive(ctx, fc.Drive{DriveID: rootDriveID, PathOnHost: image, IsRootDevice: false, IsReadOnly: true}); err != nil {
 		return err
 	}
 	// Each actor container's ext4 rootfs image is a writable, non-root drive.

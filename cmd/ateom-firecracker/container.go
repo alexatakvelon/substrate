@@ -44,10 +44,12 @@ const (
 	// count stays within a single letter suffix (/dev/vdb.. /dev/vdz).
 	maxActorContainers = 24
 
-	// blockDriver is the kata-agent storage driver for the actor rootfs device.
-	// Firecracker exposes virtio over MMIO (not PCI), so "mmioblk". This, and the
-	// /dev/vdN source derived in guestBlockDevice, are the parts most likely to
-	// need adjustment against a real kata-agent build (see the package doc).
+	// blockDriver is the kata-agent Storage handler for the actor rootfs device.
+	// Firecracker exposes virtio-block over MMIO; the guest agent's handler for
+	// that is "mmioblk". Note this is the AGENT's handler name, which differs from
+	// the kata RUNTIME's block_device_driver config value ("virtio-blk-mmio") --
+	// the agent rejects the latter with "Failed to find the storage handler".
+	// Validated against the kata 4.x agent on a KVM node.
 	blockDriver = "mmioblk"
 
 	// rootDriveID is the Firecracker drive_id of the kata guest OS image (the read
