@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -96,4 +97,21 @@ func (s *AteomService) setupActorTap(ctx context.Context, name string) error {
 		}
 		return nil
 	})
+}
+
+// actorVethMTU reads the MTU of the actor veth (eth0 in the interior netns) so
+// the guest eth0 can be configured with a matching MTU via the kata-agent.
+// Defaults to 1500 if the link can't be read.
+func (s *AteomService) actorVethMTU(ctx context.Context) int {
+	mtu := 1500
+	_ = ateomnet.NetNSDo(ctx, s.interiorNetNS, func(ctx context.Context) error {
+		if l, err := netlink.LinkByName(ateomnet.ActorVethName); err == nil {
+			mtu = l.Attrs().MTU
+		} else {
+			slog.WarnContext(ctx, "Failed to read actor veth MTU; using default",
+				slog.String("link", ateomnet.ActorVethName), slog.Int("default_mtu", mtu), slog.Any("err", err))
+		}
+		return nil
+	})
+	return mtu
 }

@@ -17,19 +17,19 @@
 // Command ateom-firecracker is the Firecracker micro-VM implementation of the
 // ateompb.Ateom service, a peer to cmd/ateom-gvisor and cmd/ateom-microvm.
 //
-// This is the skeleton stage of the Firecracker sandbox class: it cold-boots a
-// bare Firecracker VM with the kata guest (guest kernel + kata rootfs image on a
-// virtio-block root device, a tap NIC wired into the interior netns, and a
-// virtio-vsock for the kata-agent) and confirms the kata-agent is reachable. It
-// implements RunWorkload (cold boot) and TerminateWorkload; the remaining Ateom
-// RPCs -- CheckpointWorkload, RestoreWorkload, GetWorkloadStats,
-// GetActiveWorkloadStats -- are stubs pending later increments (see stubs.go).
+// It cold-boots a Firecracker VM with the kata guest (guest kernel + kata rootfs
+// image on a virtio-block root device, a tap NIC wired into the interior netns,
+// and a virtio-vsock for the kata-agent), then drives the kata-agent directly
+// (no kata shim) to configure guest networking and start the actor's containers
+// -- each on its own virtio-block ext4 rootfs, since Firecracker has no
+// virtio-fs. It implements RunWorkload (cold boot + container start) and
+// TerminateWorkload; the remaining Ateom RPCs -- CheckpointWorkload,
+// RestoreWorkload, GetWorkloadStats, GetActiveWorkloadStats -- are stubs pending
+// later increments (see stubs.go).
 //
-// Not yet implemented, and where each lands:
-//   - actor container start over the kata-agent, backed by a block (not
-//     virtio-fs) rootfs -- the next increment;
-//   - suspend/resume via Firecracker snapshot/restore with userfaultfd -- the
-//     increment after that.
+// Not yet implemented:
+//   - suspend/resume via Firecracker snapshot/restore with userfaultfd;
+//   - workload stats and actor-container log forwarding.
 package main
 
 import (
