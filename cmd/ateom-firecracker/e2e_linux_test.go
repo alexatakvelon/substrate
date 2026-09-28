@@ -390,25 +390,8 @@ func TestFCServeHTTP(t *testing.T) {
 		dumpConsole(t, consolePath)
 		t.Fatalf("configureGuestNetwork: %v", err)
 	}
-	httpdSpec := &specs.Spec{
-		Version: "1.0.0",
-		Process: &specs.Process{
-			Args: []string{"/bin/busybox", "httpd", "-f", "-p", "80", "-h", "/www"}, Cwd: "/",
-			Env:          []string{"PATH=/bin"},
-			Capabilities: &specs.LinuxCapabilities{Bounding: defaultCaps, Effective: defaultCaps, Permitted: defaultCaps},
-		},
-		Root: &specs.Root{Path: "rootfs"},
-		Mounts: []specs.Mount{
-			{Destination: "/proc", Type: "proc", Source: "proc"},
-			{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
-			{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
-		},
-		Linux: &specs.Linux{Namespaces: []specs.LinuxNamespace{
-			{Type: specs.PIDNamespace}, {Type: specs.IPCNamespace}, {Type: specs.UTSNamespace}, {Type: specs.MountNamespace},
-		}},
-	}
 	if err := ac.StartBlockRootfsContainer(ctx, kata.BlockRootfsOpts{
-		ContainerID: podUID, Spec: httpdSpec,
+		ContainerID: podUID, Spec: httpdSpec(),
 		GuestRootfsPath: "/run/kata-containers/" + podUID + "/rootfs",
 		BlockDriver:     blockDriver, BlockSource: guestBlockDevice(0),
 	}); err != nil {
@@ -443,4 +426,197 @@ func TestFCServeHTTP(t *testing.T) {
 		t.Fatalf("unexpected body %q", body)
 	}
 	t.Logf("SUCCESS: served HTTP from container over the actor network: %q", strings.TrimSpace(body))
+}
+
+// httpGetActor GETs the actor IP, retrying while the container comes up.
+func httpGetActor(timeout time.Duration) (string, error) {
+	url := "http://" + ateomnet.ActorVethIP + ":80/"
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(url)
+		if err != nil {
+			lastErr = err
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return string(b), nil
+	}
+	return "", lastErr
+}
+
+// TestFCSuspendResume is the suspend/resume proof, exercising the real
+// internal/fc snapshot API and the same file handling checkpoint.go/restore.go
+// use: boot a guest serving HTTP, snapshot it (pause + CreateSnapshot + capture
+// the block rootfs), kill the VMM, then restore into a fresh VMM (place the
+// rootfs image, rebuild the tap, LoadSnapshot + resume) and confirm the same
+// container still serves -- i.e. the guest resumed from RAM rather than
+// rebooting. Image mode; FCTEST_ROOTFS must be a busybox-httpd rootfs.
+func TestFCSuspendResume(t *testing.T) {
+	rootfs := os.Getenv("FCTEST_ROOTFS")
+	if rootfs == "" {
+		t.Skip("FCTEST_ROOTFS not set")
+	}
+	if env("FCTEST_MODE", "initrd") != "image" {
+		t.Skip("suspend/resume test runs in image mode")
+	}
+	workdir := env("FCTEST_WORKDIR", t.TempDir())
+	_ = os.MkdirAll(workdir, 0o755)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	const podUID = "e2e"
+	ns, err := ateomnet.CreateNetNSWithoutSwitching(ateompath.AteomNetNSName(podUID))
+	if err != nil {
+		t.Fatalf("CreateNetNSWithoutSwitching: %v", err)
+	}
+	s := &AteomService{interiorNetNS: ns}
+	t.Cleanup(func() { _ = ateomnet.CleanupActorNetwork(context.Background(), ns) })
+	if err := ateomnet.SetupActorNetwork(ctx, ateomnet.NetworkConfig{InteriorNetNS: ns, HostVethHWAddr: hostVethHWAddr, SweepInteriorLinks: true}); err != nil {
+		t.Fatalf("SetupActorNetwork: %v", err)
+	}
+	if err := s.setupActorTap(ctx, tapName); err != nil {
+		t.Fatalf("setupActorTap: %v", err)
+	}
+
+	img := filepath.Join(workdir, "ctr-rootfs.ext4")
+	if err := buildRootfsImage(ctx, rootfs, img); err != nil {
+		t.Fatalf("buildRootfsImage: %v", err)
+	}
+	uds := filepath.Join(workdir, "vsock.sock")
+	apiSock := filepath.Join(workdir, "fc.sock")
+	kernel, kataImg := os.Getenv("FCTEST_KERNEL"), os.Getenv("FCTEST_IMAGE")
+	bootArgs := env("FCTEST_BOOTARGS", defaultImageArgs)
+	fcbin := env("FCTEST_FCBIN", "firecracker")
+
+	// --- boot + start httpd container (as in TestFCServeHTTP) ---
+	cf, _ := os.Create(filepath.Join(workdir, "console.log"))
+	defer cf.Close()
+	cmd, client, err := fc.LaunchVMM(ctx, fc.LaunchVMMOptions{Binary: fcbin, APISocket: apiSock, NetnsPath: ateompath.AteomNetNSPath(podUID), Stdout: cf, Stderr: cf})
+	if err != nil {
+		t.Fatalf("LaunchVMM: %v", err)
+	}
+	killed := false
+	t.Cleanup(func() {
+		if !killed && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+	})
+	mustPut := func(what string, err error) {
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	mustPut("machine", client.PutMachineConfig(ctx, fc.MachineConfig{VCPUCount: 1, MemSizeMiB: 512}))
+	mustPut("boot", client.PutBootSource(ctx, fc.BootSource{KernelImagePath: kernel, BootArgs: bootArgs}))
+	mustPut("drive-rootfs", client.PutDrive(ctx, fc.Drive{DriveID: "rootfs", PathOnHost: kataImg, IsRootDevice: false, IsReadOnly: true}))
+	mustPut("drive-ctr", client.PutDrive(ctx, fc.Drive{DriveID: "ctr", PathOnHost: img, IsRootDevice: false, IsReadOnly: false}))
+	mustPut("net", client.PutNetworkInterface(ctx, fc.NetworkInterface{IfaceID: "eth0", HostDevName: tapName, GuestMAC: actorGuestMAC}))
+	mustPut("vsock", client.PutVsock(ctx, fc.Vsock{GuestCID: 3, UDSPath: uds}))
+	mustPut("start", client.Start(ctx))
+
+	ac, err := dialAgentRetry(ctx, uds, 60*time.Second)
+	if err != nil {
+		t.Fatalf("dialAgent: %v", err)
+	}
+	mustPut("sandbox", ac.CreateSandboxForActor(ctx, kata.CreateSandboxOpts{SandboxID: podUID, Hostname: podUID}))
+	mustPut("guestnet", s.configureGuestNetwork(ctx, ac, uint64(s.actorVethMTU(ctx))))
+	mustPut("container", ac.StartBlockRootfsContainer(ctx, kata.BlockRootfsOpts{
+		ContainerID: podUID, Spec: httpdSpec(), GuestRootfsPath: "/run/kata-containers/" + podUID + "/rootfs",
+		BlockDriver: blockDriver, BlockSource: guestBlockDevice(0),
+	}))
+	if body, err := httpGetActor(30 * time.Second); err != nil || !strings.Contains(body, "FIRECRACKER_E2E_OK") {
+		t.Fatalf("pre-suspend GET failed: body=%q err=%v", body, err)
+	}
+	t.Log("workload serving before suspend")
+
+	// --- suspend: pause + snapshot (mem+vmstate) + capture the block rootfs ---
+	snapDir := filepath.Join(workdir, "snap")
+	_ = os.MkdirAll(snapDir, 0o755)
+	_ = ac.Close()
+	if err := client.PauseVM(ctx); err != nil {
+		t.Fatalf("PauseVM: %v", err)
+	}
+	if err := client.CreateSnapshot(ctx, fc.CreateSnapshotConfig{
+		SnapshotPath: filepath.Join(snapDir, snapVMState), MemFilePath: filepath.Join(snapDir, snapMemFile),
+	}); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	if err := copyFile(img, filepath.Join(snapDir, "ctr.ext4")); err != nil {
+		t.Fatalf("capture rootfs: %v", err)
+	}
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
+	killed = true
+	_ = os.Remove(uds) // firecracker binds a fresh vsock uds on load
+	// Mirror the real checkpoint teardown (teardownActor -> CleanupActorNetwork):
+	// the worker's actor network is dropped when the actor is suspended.
+	_ = ateomnet.CleanupActorNetwork(ctx, ns)
+	t.Log("snapshot taken, VMM killed, network torn down (worker freed)")
+
+	// --- restore: fresh host networking, place rootfs, launch VMM, load+resume ---
+	if err := copyFile(filepath.Join(snapDir, "ctr.ext4"), img); err != nil {
+		t.Fatalf("place rootfs: %v", err)
+	}
+	// Rebuild the veth + tap fresh (as RestoreWorkload does). Same names + fixed
+	// MACs, so the restored guest's frozen ARP for the gateway stays valid.
+	if err := ateomnet.SetupActorNetwork(ctx, ateomnet.NetworkConfig{InteriorNetNS: ns, HostVethHWAddr: hostVethHWAddr, SweepInteriorLinks: true}); err != nil {
+		t.Fatalf("SetupActorNetwork (restore): %v", err)
+	}
+	if err := s.setupActorTap(ctx, tapName); err != nil {
+		t.Fatalf("setupActorTap (restore): %v", err)
+	}
+	cf2, _ := os.Create(filepath.Join(workdir, "console2.log"))
+	defer cf2.Close()
+	cmd2, client2, err := fc.LaunchVMM(ctx, fc.LaunchVMMOptions{Binary: fcbin, APISocket: apiSock, NetnsPath: ateompath.AteomNetNSPath(podUID), Stdout: cf2, Stderr: cf2})
+	if err != nil {
+		t.Fatalf("LaunchVMM (restore): %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd2.Process != nil {
+			_ = cmd2.Process.Kill()
+			_, _ = cmd2.Process.Wait()
+		}
+	})
+	tRestore := time.Now()
+	if err := client2.LoadSnapshot(ctx, fc.LoadSnapshotConfig{
+		SnapshotPath: filepath.Join(snapDir, snapVMState), MemBackendPath: filepath.Join(snapDir, snapMemFile), ResumeVM: true,
+	}); err != nil {
+		dumpConsole(t, filepath.Join(workdir, "console2.log"))
+		t.Fatalf("LoadSnapshot: %v", err)
+	}
+	restoreDur := time.Since(tRestore)
+
+	// The same container must still serve -- it resumed from RAM, not rebooted.
+	body, err := httpGetActor(30 * time.Second)
+	if err != nil || !strings.Contains(body, "FIRECRACKER_E2E_OK") {
+		dumpConsole(t, filepath.Join(workdir, "console2.log"))
+		t.Fatalf("post-restore GET failed: body=%q err=%v", body, err)
+	}
+	t.Logf("SUCCESS: suspend/resume round-trip; workload served after restore (load+resume %v): %q", restoreDur, strings.TrimSpace(body))
+}
+
+// httpdSpec is the busybox-httpd container spec shared by the networking and
+// suspend/resume tests.
+func httpdSpec() *specs.Spec {
+	return &specs.Spec{
+		Version: "1.0.0",
+		Process: &specs.Process{
+			Args: []string{"/bin/busybox", "httpd", "-f", "-p", "80", "-h", "/www"}, Cwd: "/",
+			Env:          []string{"PATH=/bin"},
+			Capabilities: &specs.LinuxCapabilities{Bounding: defaultCaps, Effective: defaultCaps, Permitted: defaultCaps},
+		},
+		Root: &specs.Root{Path: "rootfs"},
+		Mounts: []specs.Mount{
+			{Destination: "/proc", Type: "proc", Source: "proc"},
+			{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+			{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+		},
+		Linux: &specs.Linux{Namespaces: []specs.LinuxNamespace{
+			{Type: specs.PIDNamespace}, {Type: specs.IPCNamespace}, {Type: specs.UTSNamespace}, {Type: specs.MountNamespace},
+		}},
+	}
 }

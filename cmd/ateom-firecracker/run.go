@@ -297,6 +297,26 @@ func (s *AteomService) coldBootActor(ctx context.Context, req *ateompb.RunWorklo
 	return nil
 }
 
+// actorMeta is the set of actor-identifying getters shared by the workload
+// RPC requests, so one helper builds an attribution from any of them.
+type actorMeta interface {
+	GetAtespace() string
+	GetActorName() string
+	GetActorUid() string
+	GetActorTemplateAtespace() string
+	GetActorTemplateName() string
+}
+
+// actorAttribution regroups the actor identity from a workload request.
+func actorAttribution(m actorMeta) resources.ActorAttribution {
+	return resources.ActorAttribution{
+		Ref:              resources.ActorRef{Atespace: m.GetAtespace(), Name: m.GetActorName()},
+		UID:              m.GetActorUid(),
+		TemplateAtespace: m.GetActorTemplateAtespace(),
+		TemplateName:     m.GetActorTemplateName(),
+	}
+}
+
 // containerNames returns the guest container ids for the actor's containers, in
 // order -- recorded on runningActor so teardown knows which to signal.
 func containerNames(ctrs []actorContainer) []string {

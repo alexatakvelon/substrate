@@ -100,7 +100,7 @@ func (s *AteomService) buildActorContainers(ctx context.Context, actorUID string
 			return nil, fmt.Errorf("loading OCI spec for %q: %w", name, err)
 		}
 		rootfsDir := filepath.Join(bundle, "rootfs")
-		img := filepath.Join(fcVMDir(actorUID), "rootfs-"+name+".ext4")
+		img := containerRootfsImage(actorUID, name)
 		if err := buildRootfsImage(ctx, rootfsDir, img); err != nil {
 			return nil, fmt.Errorf("building rootfs image for %q: %w", name, err)
 		}
@@ -122,6 +122,26 @@ func (s *AteomService) buildActorContainers(ctx context.Context, actorUID string
 func guestBlockDevice(i int) string {
 	return "/dev/vd" + string(rune('b'+i))
 }
+
+// containerRootfsImage is the host path of the ext4 rootfs image backing a
+// container's virtio-block drive. It sits under the actor's VM dir; checkpoint
+// copies it into the snapshot and restore places it back here (the snapshot's
+// device config references this exact path).
+func containerRootfsImage(actorUID, containerName string) string {
+	return filepath.Join(fcVMDir(actorUID), "rootfs-"+containerName+".ext4")
+}
+
+// rootfsSnapName is the (relative) name a container's rootfs image is stored
+// under inside a snapshot, alongside the memory and vmstate files.
+func rootfsSnapName(containerName string) string {
+	return "rootfs-" + containerName + ".ext4"
+}
+
+// Snapshot file names within a checkpoint/restore directory.
+const (
+	snapVMState = "vmstate" // Firecracker device + vCPU state
+	snapMemFile = "mem"     // guest RAM
+)
 
 // buildRootfsImage bakes the directory tree at rootfsDir into a fresh ext4 image
 // at imgPath, sized to the content plus headroom for the container's writes. It

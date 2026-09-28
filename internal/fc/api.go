@@ -80,12 +80,14 @@ func (c *apiClient) getJSON(ctx context.Context, path string, out any) error {
 
 // put issues a PUT with a JSON body (nil for an empty body) and requires a 2xx.
 // Firecracker returns 204 No Content for successful configuration writes.
-//
-// The snapshot/restore increment will add a PATCH sibling: Firecracker uses
-// PATCH for in-place updates such as pausing the VM state and swapping a drive's
-// backing path on a running guest.
 func (c *apiClient) put(ctx context.Context, path string, in any) error {
 	return c.write(ctx, http.MethodPut, path, in)
+}
+
+// patch issues a PATCH with a JSON body and requires a 2xx. Firecracker uses
+// PATCH for in-place updates such as changing the VM state (Paused/Resumed).
+func (c *apiClient) patch(ctx context.Context, path string, in any) error {
+	return c.write(ctx, http.MethodPatch, path, in)
 }
 
 func (c *apiClient) write(ctx context.Context, method, path string, in any) error {

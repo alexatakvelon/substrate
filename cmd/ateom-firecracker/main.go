@@ -314,8 +314,9 @@ func runAtunnel(ctx context.Context, upstream *url.URL) (*atunnel.Server, *atunn
 }
 
 const (
-	rpcRunWorkload     = "RunWorkload"
-	rpcRestoreWorkload = "RestoreWorkload"
+	rpcRunWorkload        = "RunWorkload"
+	rpcRestoreWorkload    = "RestoreWorkload"
+	rpcCheckpointWorkload = "CheckpointWorkload"
 )
 
 // activeRPCInfo identifies the workload RPC currently holding lock, so graceful
