@@ -34,12 +34,17 @@ package main
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-firecracker/internal/kata"
+	"github.com/agent-substrate/substrate/internal/ateomnet"
+	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/fc"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -280,4 +285,162 @@ func TestFCContainerStart(t *testing.T) {
 		t.Fatalf("StartBlockRootfsContainer (driver=%s source=%s): %v", blockDriver, guestDev, err)
 	}
 	t.Logf("SUCCESS: container started on block rootfs (%s via %s)", guestDev, blockDriver)
+}
+
+// TestFCServeHTTP is the end-to-end networking proof: it wires the interior
+// netns + veth + tap with the real net.go/container.go code, boots the kata
+// guest with a tap NIC, configures guest eth0 over the kata-agent, starts a
+// busybox httpd container on the block rootfs, and GETs the actor IP from the
+// pod netns. FCTEST_ROOTFS must be a busybox rootfs with /www/index.html; runs
+// in image mode only.
+func TestFCServeHTTP(t *testing.T) {
+	rootfs := os.Getenv("FCTEST_ROOTFS")
+	if rootfs == "" {
+		t.Skip("FCTEST_ROOTFS not set")
+	}
+	if env("FCTEST_MODE", "initrd") != "image" {
+		t.Skip("networking test runs in image mode")
+	}
+	workdir := env("FCTEST_WORKDIR", t.TempDir())
+	_ = os.MkdirAll(workdir, 0o755)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	const podUID = "e2e"
+	ns, err := ateomnet.CreateNetNSWithoutSwitching(ateompath.AteomNetNSName(podUID))
+	if err != nil {
+		t.Fatalf("CreateNetNSWithoutSwitching: %v", err)
+	}
+	s := &AteomService{interiorNetNS: ns}
+	t.Cleanup(func() { _ = ateomnet.CleanupActorNetwork(context.Background(), ns) })
+
+	// Real host-side networking: veth into the interior netns + the guest tap.
+	if err := ateomnet.SetupActorNetwork(ctx, ateomnet.NetworkConfig{
+		InteriorNetNS:      ns,
+		HostVethHWAddr:     hostVethHWAddr,
+		SweepInteriorLinks: true,
+	}); err != nil {
+		t.Fatalf("SetupActorNetwork: %v", err)
+	}
+	if err := s.setupActorTap(ctx, tapName); err != nil {
+		t.Fatalf("setupActorTap: %v", err)
+	}
+
+	img := filepath.Join(workdir, "ctr-rootfs.ext4")
+	if err := buildRootfsImage(ctx, rootfs, img); err != nil {
+		t.Fatalf("buildRootfsImage: %v", err)
+	}
+
+	consolePath := filepath.Join(workdir, "console.log")
+	cf, err := os.Create(consolePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cf.Close()
+	// Launch inside the interior netns so Firecracker opens the tap by name.
+	cmd, client, err := fc.LaunchVMM(ctx, fc.LaunchVMMOptions{
+		Binary:    env("FCTEST_FCBIN", "firecracker"),
+		APISocket: filepath.Join(workdir, "fc.sock"),
+		NetnsPath: ateompath.AteomNetNSPath(podUID),
+		Stdout:    cf, Stderr: cf,
+	})
+	if err != nil {
+		t.Fatalf("LaunchVMM: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+	})
+	if err := client.PutMachineConfig(ctx, fc.MachineConfig{VCPUCount: 1, MemSizeMiB: 512}); err != nil {
+		t.Fatalf("PutMachineConfig: %v", err)
+	}
+	if err := client.PutBootSource(ctx, fc.BootSource{KernelImagePath: os.Getenv("FCTEST_KERNEL"), BootArgs: env("FCTEST_BOOTARGS", defaultImageArgs)}); err != nil {
+		t.Fatalf("PutBootSource: %v", err)
+	}
+	if err := client.PutDrive(ctx, fc.Drive{DriveID: "rootfs", PathOnHost: os.Getenv("FCTEST_IMAGE"), IsRootDevice: false, IsReadOnly: true}); err != nil {
+		t.Fatalf("PutDrive rootfs: %v", err)
+	}
+	if err := client.PutDrive(ctx, fc.Drive{DriveID: "ctr", PathOnHost: img, IsRootDevice: false, IsReadOnly: false}); err != nil {
+		t.Fatalf("PutDrive ctr: %v", err)
+	}
+	if err := client.PutNetworkInterface(ctx, fc.NetworkInterface{IfaceID: "eth0", HostDevName: tapName, GuestMAC: actorGuestMAC}); err != nil {
+		t.Fatalf("PutNetworkInterface: %v", err)
+	}
+	uds := filepath.Join(workdir, "vsock.sock")
+	if err := client.PutVsock(ctx, fc.Vsock{GuestCID: 3, UDSPath: uds}); err != nil {
+		t.Fatalf("PutVsock: %v", err)
+	}
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	ac, err := dialAgentRetry(ctx, uds, 60*time.Second)
+	if err != nil {
+		dumpConsole(t, consolePath)
+		t.Fatalf("dialAgent: %v", err)
+	}
+	defer ac.Close()
+	if err := ac.CreateSandboxForActor(ctx, kata.CreateSandboxOpts{SandboxID: podUID, Hostname: podUID}); err != nil {
+		t.Fatalf("CreateSandbox: %v", err)
+	}
+	// Real guest network config (net.go/container.go): eth0 IP/MAC/MTU + routes.
+	if err := s.configureGuestNetwork(ctx, ac, uint64(s.actorVethMTU(ctx))); err != nil {
+		dumpConsole(t, consolePath)
+		t.Fatalf("configureGuestNetwork: %v", err)
+	}
+	httpdSpec := &specs.Spec{
+		Version: "1.0.0",
+		Process: &specs.Process{
+			Args: []string{"/bin/busybox", "httpd", "-f", "-p", "80", "-h", "/www"}, Cwd: "/",
+			Env:          []string{"PATH=/bin"},
+			Capabilities: &specs.LinuxCapabilities{Bounding: defaultCaps, Effective: defaultCaps, Permitted: defaultCaps},
+		},
+		Root: &specs.Root{Path: "rootfs"},
+		Mounts: []specs.Mount{
+			{Destination: "/proc", Type: "proc", Source: "proc"},
+			{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+			{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+		},
+		Linux: &specs.Linux{Namespaces: []specs.LinuxNamespace{
+			{Type: specs.PIDNamespace}, {Type: specs.IPCNamespace}, {Type: specs.UTSNamespace}, {Type: specs.MountNamespace},
+		}},
+	}
+	if err := ac.StartBlockRootfsContainer(ctx, kata.BlockRootfsOpts{
+		ContainerID: podUID, Spec: httpdSpec,
+		GuestRootfsPath: "/run/kata-containers/" + podUID + "/rootfs",
+		BlockDriver:     blockDriver, BlockSource: guestBlockDevice(0),
+	}); err != nil {
+		dumpConsole(t, consolePath)
+		t.Fatalf("StartBlockRootfsContainer: %v", err)
+	}
+
+	// GET the actor IP from the pod netns (the veth host end lives here). Retry
+	// while the container's httpd comes up.
+	url := "http://" + ateomnet.ActorVethIP + ":80/"
+	var body string
+	deadline := time.Now().Add(30 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(url)
+		if err != nil {
+			lastErr = err
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		body, lastErr = string(b), nil
+		break
+	}
+	if lastErr != nil {
+		dumpConsole(t, consolePath)
+		t.Fatalf("GET %s: %v", url, lastErr)
+	}
+	if !strings.Contains(body, "FIRECRACKER_E2E_OK") {
+		dumpConsole(t, consolePath)
+		t.Fatalf("unexpected body %q", body)
+	}
+	t.Logf("SUCCESS: served HTTP from container over the actor network: %q", strings.TrimSpace(body))
 }

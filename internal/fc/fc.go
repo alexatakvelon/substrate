@@ -29,7 +29,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"time"
+
+	"github.com/vishvananda/netns"
 )
 
 // Client talks to one Firecracker VMM over its unix api-socket.
@@ -99,11 +102,13 @@ type LaunchVMMOptions struct {
 	Binary string
 	// APISocket is the api-socket path the new VMM should listen on.
 	APISocket string
-	// NetnsPath, when set, is the network-namespace file Firecracker joins
-	// before creating the VM (its --netns flag). The tap the VM's virtio-net
-	// binds to lives in that namespace, so the VMM must open it there. Firecracker
-	// opens the tap by name, unlike cloud-hypervisor which adopts a passed FD, so
-	// entering the namespace is how the device is reached.
+	// NetnsPath, when set, is the network-namespace file the Firecracker process
+	// is launched into. The tap the VM's virtio-net binds to lives in that
+	// namespace, and Firecracker opens the tap by name (unlike cloud-hypervisor,
+	// which adopts a passed FD), so the VMM process itself must be in that
+	// namespace. Bare Firecracker has no namespace flag of its own (that is a
+	// jailer feature), so LaunchVMM enters the namespace before exec; see
+	// startInNetns.
 	NetnsPath string
 	// Stdout/Stderr receive the VMM's output.
 	Stdout, Stderr io.Writer
@@ -124,16 +129,12 @@ func LaunchVMM(ctx context.Context, o LaunchVMMOptions) (*exec.Cmd, *Client, err
 	// Firecracker refuses to start if the api-socket path already exists.
 	_ = os.Remove(o.APISocket)
 
-	args := []string{"--api-sock", o.APISocket}
-	if o.NetnsPath != "" {
-		args = append(args, "--netns", o.NetnsPath)
-	}
 	// Deliberately NOT exec.CommandContext: the VMM must outlive the RPC whose
 	// ctx launched it. The caller owns cmd; WaitReady honors ctx.
-	cmd := exec.Command(bin, args...)
+	cmd := exec.Command(bin, "--api-sock", o.APISocket)
 	cmd.Stdout = o.Stdout
 	cmd.Stderr = o.Stderr
-	if err := cmd.Start(); err != nil {
+	if err := startInNetns(cmd, o.NetnsPath); err != nil {
 		return nil, nil, fmt.Errorf("while starting firecracker: %w", err)
 	}
 	client := NewClient(o.APISocket)
@@ -143,4 +144,36 @@ func LaunchVMM(ctx context.Context, o LaunchVMMOptions) (*exec.Cmd, *Client, err
 		return nil, nil, fmt.Errorf("while waiting for VMM api-socket: %w", err)
 	}
 	return cmd, client, nil
+}
+
+// startInNetns starts cmd, first entering the network namespace at netnsPath
+// when it is set. Bare Firecracker cannot enter a namespace itself, and it opens
+// its tap by name, so the VMM process must already be in the namespace that
+// holds the tap.
+//
+// The switch runs on a dedicated OS thread that is locked and never unlocked, so
+// the child forked by cmd.Start inherits the target namespace while the change
+// is confined to that thread: the Go runtime destroys a still-locked thread when
+// its goroutine returns, discarding the namespace change rather than leaking it
+// to the rest of the process.
+func startInNetns(cmd *exec.Cmd, netnsPath string) error {
+	if netnsPath == "" {
+		return cmd.Start()
+	}
+	errc := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread() // no UnlockOSThread: see the doc comment
+		target, err := netns.GetFromPath(netnsPath)
+		if err != nil {
+			errc <- fmt.Errorf("opening netns %q: %w", netnsPath, err)
+			return
+		}
+		defer target.Close()
+		if err := netns.Set(target); err != nil {
+			errc <- fmt.Errorf("entering netns %q: %w", netnsPath, err)
+			return
+		}
+		errc <- cmd.Start()
+	}()
+	return <-errc
 }
